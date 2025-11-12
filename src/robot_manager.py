@@ -59,9 +59,12 @@ class RobotController:
 		]
 
 		# Speed settings (m/s or rad/s)
-		self.arm_speed = 0.1
+		self.arm_speed = 0.1 # m/s for position control
+		self.gripper_speed = 0.5 # rad/s for position control
+		self.ee_velocity = 0.2 # m/s for velocity control
+		self.gripper_rot_velocity = 0.5 # rad/s for velocity control
 
-		# Predefined duration for each waypoint in an arm movement
+		# Predefined duration for each waypoint in a movement
 		self.waypoint_duration = 0.005
 		
 		# Internal state for holding objects
@@ -159,39 +162,56 @@ class RobotController:
 			self.simulate_step(step_duration)
 
 	def rotate_gripper_yaw(self, yaw_angle, duration=0.5):
-		"""Rotate gripper to target yaw angle smoothly."""
-		# 1) get full EE rotation matrix
+		"""Rotates the gripper to a target yaw angle in the world frame."""
+		# Convert yaw angle to radians
+		yaw_angle = np.deg2rad(yaw_angle)
+
+		# Get the end-effector (EE) rotation matrix from its quaternion
 		q = self.get_ee_pose()[1]
-		R = np.array(p.getMatrixFromQuaternion(q)).reshape(3,3)
+		R = np.array(p.getMatrixFromQuaternion(q)).reshape(3, 3)
 
-		# 2) EE's local Z axis in world frame
-		z_world = R[:,2]
+		# Determine the EE's local Z-axis direction in the world frame
+		z_world = R[:, 2]
 
-		# 3) if that axis points mostly DOWN (z<0), flips sign of yaw→joint mapping
+		# Check if the EE is pointing mostly down (z < 0) to determine the mapping sign
 		sign = 1.0 if z_world[2] >= 0 else -1.0
 
-		# 4) what's our current joint‐relative yaw?
+		# Get the current angle of the gripper joint relative to its neutral position
 		q_raw = self.joints[self._gripper_joint_id].get_position()
-		rel0  = q_raw - self.wrist_neutral
+		rel0 = q_raw - self.wrist_neutral
 
-		# 5) compute true global yaw now (from your helper or R→atan2), but
-		#    we only need the delta in global yaw:
+		# Calculate the shortest angular distance (delta) to the target yaw
 		_, _, glob_yaw = p.getEulerFromQuaternion(q)
-		dglob = (yaw_angle - glob_yaw + np.pi) % (2*np.pi) - np.pi
+		dglob = (yaw_angle - glob_yaw + np.pi) % (2 * np.pi) - np.pi
 
-		# 6) map that into joint‐space delta, accounting for the flip
+		# Map the global yaw delta to the required joint-space delta
 		djoint = sign * dglob
 
-		# Calculate steps based on duration instead of hardcoded 0.05
-		step_duration = 0.05  # Keep this for smooth motion
-		N = max(int(duration / step_duration), 1)
+		# Calculate duration and number of steps for a smooth motion
+		if abs(dglob) < 1e-6: # No rotation needed
+			return
+		duration = abs(dglob) / self.gripper_speed
+		num_steps = max(int(duration / self.waypoint_duration), 1)
+		step_duration = duration / num_steps
 
-		for i in range(1, N+1):
-			rel = rel0 + djoint * (i/N)
+		# Get current positions of all arm joints to hold them steady
+		current_arm_joints = self.get_pos()
+
+		# Execute the rotation by interpolating the joint angle
+		for i in range(1, num_steps + 1):
+			# Hold other arm joints at their current positions
+			self.set_joint_positions(current_arm_joints)
+
+			# Calculate the target joint angle for this step
+			rel = rel0 + djoint * (i / num_steps)
 			q_cmd = rel + self.wrist_neutral
+			
+			# Clip the command to respect the joint's physical limits
 			q_cmd = np.clip(q_cmd,
 							self.joints[self._gripper_joint_id].limits['lower'],
 							self.joints[self._gripper_joint_id].limits['upper'])
+			
+			# Send the command for the gripper joint and step the simulation
 			self.joints[self._gripper_joint_id].set_position(q_cmd)
 			self.simulate_step(step_duration)
 
@@ -271,69 +291,6 @@ class RobotController:
 		"""Set all joint positions simultaneously."""
 		for i in range(7):
 			self.joints[i].set_position(joint_angles[i])
-
-	def rotate_grasped_object(self, target_world_orn, duration=1.0, steps=20):
-		"""
-		Rotates the grasped object to a target orientation in the world frame.
-
-		This is achieved by removing and recreating the grasp constraint at each step
-		of a smooth interpolation, without moving the robot's joints.
-
-		Args:
-			target_world_orn (list): Target orientation as Euler angles [roll, pitch, yaw].
-			duration (float): The total time the rotation should take.
-			steps (int): The number of intermediate steps for the interpolation.
-		"""
-		if self._grasped_object_id is None or self._grasp_constraint_id is None:
-			print("Error: No object is currently grasped.")
-			return
-
-		# Get the object's starting pose and the end-effector's inverse pose
-		obj_pos_world, start_obj_orn_world = p.getBasePositionAndOrientation(self._grasped_object_id)
-		ee_pos, ee_orn = p.getLinkState(self.robot_id, self._end_effector_link_id)[:2]
-		inv_ee_pos, inv_ee_orn = p.invertTransform(ee_pos, ee_orn)
-
-		# Convert target Euler angles to a quaternion
-		target_obj_orn_world = p.getQuaternionFromEuler(target_world_orn)
-
-		# Interpolate the rotation over several steps
-		for i in range(steps):
-			interp_frac = (i + 1) / float(steps)
-
-			# Use getQuaternionSlerp for spherical linear interpolation
-			interp_obj_orn_world = p.getQuaternionSlerp(start_obj_orn_world, target_obj_orn_world, interp_frac)
-
-			# Calculate the new relative pose of the object with respect to the end-effector
-			# T_relative = T_end_effector_inverse * T_object_world
-			new_rel_pos, new_rel_orn = p.multiplyTransforms(
-				inv_ee_pos,
-				inv_ee_orn,
-				obj_pos_world,         # Keep the object's world position constant
-				interp_obj_orn_world   # Use the new interpolated world orientation
-			)
-
-			# Remove the old constraint
-			p.removeConstraint(self._grasp_constraint_id)
-
-			# Create a new fixed constraint with the updated relative orientation
-			new_constraint_id = p.createConstraint(
-				parentBodyUniqueId=self.robot_id,
-				parentLinkIndex=self._end_effector_link_id,
-				childBodyUniqueId=self._grasped_object_id,
-				childLinkIndex=-1,
-				jointType=p.JOINT_FIXED,
-				jointAxis=[0, 0, 0],
-				parentFramePosition=new_rel_pos,
-				parentFrameOrientation=new_rel_orn,
-				childFramePosition=[0, 0, 0],
-				childFrameOrientation=[0, 0, 0, 1]
-			)
-
-			# Update the stored constraint ID
-			self._grasp_constraint_id = new_constraint_id
-
-			p.stepSimulation()
-			time.sleep(duration / steps)
 
 	def pick_object(self, obj_id, target_yaw=None, approach_height=0.3, grasp_height=0.1):
 		"""Pick up object by grasping and creating constraint."""
@@ -417,3 +374,71 @@ class RobotController:
 		# self.rotate_gripper_yaw(0)
 		
 		return True
+
+	def move_ee_velocity(self, linear_velocity):
+		"""
+		Control the end-effector using a target linear velocity, while keeping
+		orientation constant.
+		"""
+		# Get the state for all movable joints
+		num_joints = p.getNumJoints(self.robot_id)
+		movable_joint_indices = [i for i in range(num_joints) if p.getJointInfo(self.robot_id, i)[2] != p.JOINT_FIXED]
+		joint_states = p.getJointStates(self.robot_id, movable_joint_indices)
+		joint_positions = [state[0] for state in joint_states]
+		zero_vec = [0] * len(joint_positions)
+
+		# Calculate the full 6D Jacobian (linear and angular)
+		jac_t, jac_r = p.calculateJacobian(
+			self.robot_id,
+			self._end_effector_link_id,
+			[0, 0, 0], # Point on link to measure, in link frame
+			joint_positions,
+			zero_vec,
+			zero_vec
+		)
+
+		# We only want to control the 7 arm joints
+		jac_t_arm = np.array(jac_t)[:, :7]
+		jac_r_arm = np.array(jac_r)[:, :7]
+		
+		# Stack the Jacobians to create a 6x7 matrix for 6D control
+		full_jacobian = np.vstack((jac_t_arm, jac_r_arm))
+
+		# Define the 6D target velocity: [vx, vy, vz, wx, wy, wz]
+		# We want the commanded linear velocity and ZERO angular velocity
+		target_velocity_6d = np.hstack((linear_velocity, [0, 0, 0]))
+
+		# Use the pseudo-inverse of the full Jacobian to find joint velocities
+		try:
+			j_inv = np.linalg.pinv(full_jacobian)
+			joint_velocities = j_inv.dot(target_velocity_6d)
+
+			# Set joint motor control to VELOCITY_CONTROL for the 7 arm joints
+			for i in range(7):
+				p.setJointMotorControl2(
+					self.robot_id,
+					i,
+					controlMode=p.VELOCITY_CONTROL,
+					targetVelocity=joint_velocities[i],
+					force=self.joints[i].limits['force']
+				)
+		except np.linalg.LinAlgError:
+			# This can happen if the robot is in a singular configuration
+			for i in range(7):
+				p.setJointMotorControl2(
+					self.robot_id,
+					i,
+					controlMode=p.VELOCITY_CONTROL,
+					targetVelocity=0,
+					force=self.joints[i].limits['force']
+				)
+
+	def rotate_gripper_velocity(self, velocity):
+		"""Control the gripper rotation using a target velocity."""
+		p.setJointMotorControl2(
+			self.robot_id,
+			self._gripper_joint_id,
+			controlMode=p.VELOCITY_CONTROL,
+			targetVelocity=velocity,
+			force=self.joints[self._gripper_joint_id].limits['force']
+		)
