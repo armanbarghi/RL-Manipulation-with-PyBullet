@@ -34,7 +34,7 @@ class RobotController:
 	"""Controls robot in PyBullet simulation environment."""
 
 	def __init__(self, model_path, scale=1, initial_base_pos=[0, 0, 0],
-				 use_fixed_base=True, table_size=[1, 1]):
+				use_fixed_base=True, table_size=[1, 1]):
 		self.robot_id = p.loadURDF(
 			model_path,
 			initial_base_pos,
@@ -375,10 +375,10 @@ class RobotController:
 		
 		return True
 
-	def move_ee_velocity(self, linear_velocity):
+	def move_ee_velocity(self, linear_velocity, maintain_height=None):
 		"""
 		Control the end-effector using a target linear velocity, while keeping
-		orientation constant.
+		orientation constant (pointing down).
 		"""
 		# Get the state for all movable joints
 		num_joints = p.getNumJoints(self.robot_id)
@@ -404,16 +404,68 @@ class RobotController:
 		# Stack the Jacobians to create a 6x7 matrix for 6D control
 		full_jacobian = np.vstack((jac_t_arm, jac_r_arm))
 
+		# --- Control Logic ---
+		angular_velocity = [0, 0, 0]
+		
+		if maintain_height is not None:
+			current_ee_pos, current_ee_orn = self.get_ee_pose()
+			
+			# 1. Height Correction (P-Controller)
+			z_error = maintain_height - current_ee_pos[2]
+			kp_z = 8.0  # Increased gain for faster height correction
+			max_z_vel = 1.0 # Relaxed limit
+			
+			linear_velocity = list(linear_velocity)
+			z_correction = np.clip(kp_z * z_error, -max_z_vel, max_z_vel)
+			linear_velocity[2] = z_correction
+
+			# 2. Orientation Correction (Vector Alignment)
+			# We want the EE Z-axis to align with World -Z (pointing down)
+			rot_matrix = p.getMatrixFromQuaternion(current_ee_orn)
+			# Extract the Z-axis of the end-effector (3rd column of rotation matrix)
+			current_z_axis = np.array([rot_matrix[2], rot_matrix[5], rot_matrix[8]])
+			target_z_axis = np.array([0, 0, -1])
+			
+			# Calculate error rotation vector using cross product
+			# This gives the axis and magnitude of rotation needed to align Z-axes
+			orn_error_vec = np.cross(current_z_axis, target_z_axis)
+			
+			kp_orn = 20.0 # High gain to fight gravity/inertia
+			max_orn_vel = 2.0 # Allow fast corrective rotations
+			
+			angular_velocity = kp_orn * orn_error_vec
+			angular_velocity = np.clip(angular_velocity, -max_orn_vel, max_orn_vel)
+
 		# Define the 6D target velocity: [vx, vy, vz, wx, wy, wz]
-		# We want the commanded linear velocity and ZERO angular velocity
-		target_velocity_6d = np.hstack((linear_velocity, [0, 0, 0]))
+		target_velocity_6d = np.hstack((linear_velocity, angular_velocity))
 
-		# Use the pseudo-inverse of the full Jacobian to find joint velocities
+		# --- Damped Least Squares (DLS) Inverse Kinematics ---
+		# Lower lambda makes it more responsive, higher makes it more stable
+		dls_lambda = 0.01 
+		J = full_jacobian
+		J_T = J.T
+		lambda_matrix = (dls_lambda ** 2) * np.eye(6)
+		
 		try:
-			j_inv = np.linalg.pinv(full_jacobian)
-			joint_velocities = j_inv.dot(target_velocity_6d)
+			# Calculate DLS inverse: J_inv = J.T * inv(J * J.T + lambda^2 * I)
+			j_dls_inv = J_T.dot(np.linalg.inv(J.dot(J_T) + lambda_matrix))
+			
+			joint_velocities = j_dls_inv.dot(target_velocity_6d)
 
-			# Set joint motor control to VELOCITY_CONTROL for the 7 arm joints
+			# --- Null Space Control ---
+			# Only apply null space control if we are actively moving in XY plane
+			# This prevents "drift" when the robot is supposed to be holding position
+			if np.linalg.norm(linear_velocity[:2]) > 0.01:
+				current_arm_joints = np.array(joint_positions[:7])
+				rest_positions = np.array(self.initial_poses)
+				
+				kp_null = 1.0 # Increased null space gain
+				q_dot_null = kp_null * (rest_positions - current_arm_joints)
+				
+				null_space_proj = np.eye(7) - j_dls_inv.dot(J)
+				joint_velocities += null_space_proj.dot(q_dot_null)
+
+			# Set joint motor control
 			for i in range(7):
 				p.setJointMotorControl2(
 					self.robot_id,
@@ -423,7 +475,6 @@ class RobotController:
 					force=self.joints[i].limits['force']
 				)
 		except np.linalg.LinAlgError:
-			# This can happen if the robot is in a singular configuration
 			for i in range(7):
 				p.setJointMotorControl2(
 					self.robot_id,
