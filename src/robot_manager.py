@@ -222,11 +222,16 @@ class RobotController:
 		upper_limits = [self.joints[i].limits['upper'] for i in joint_indices]
 		joint_ranges = [upper - lower for upper, lower in zip(upper_limits, lower_limits)]
 
+		if len(orientation) == 3:
+			target_orientation = p.getQuaternionFromEuler(orientation)
+		else:
+			target_orientation = orientation
+
 		q = p.calculateInverseKinematics(
 			self.robot_id,
 			self._end_effector_link_id,
 			targetPosition=target_pose,
-			targetOrientation=p.getQuaternionFromEuler(orientation),
+			targetOrientation=target_orientation,
 			jointDamping=[0.1]*len(joint_indices),
 			lowerLimits=lower_limits,
 			upperLimits=upper_limits,
